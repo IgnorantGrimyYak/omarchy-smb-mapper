@@ -8,13 +8,13 @@ config files or on the command line.
 </p>
 
 The plugin saves share metadata locally, stores credentials in the system
-keyring through `secret-tool` / libsecret, and mounts with GVFS (`gio`) so
-**no root or polkit prompt is required**. Connected shares also appear as
-shortcuts under `~/Shares`.
+keyring through `secret-tool` / libsecret, and mounts with GVFS (`gio`).
+Connected shares also appear as shortcuts under `~/Shares`. Mounts stay in
+the user session: this plugin does not write `/etc/fstab`, does not install
+packages, and does not request elevated privileges.
 
-**This plugin does not write `/etc/fstab`.** Connect automatically remounts the
-share in your user session when Omarchy starts. It never adds a kernel CIFS
-entry, never stores a credentials file for fstab, and never asks for sudo.
+**Connect automatically remounts the share when Omarchy starts.** It never
+adds a kernel CIFS entry and never stores a system credentials file.
 
 <p align="center">
   <img src="docs/screenshots/screenshot-2026-08-21_20-01-21.png" alt="Add share form with server, share name, username, password, guest access, and connect automatically" width="100%">
@@ -28,8 +28,7 @@ These packages ship with a normal Omarchy install:
 - `gvfs`, `gvfs-smb`, `libsecret`, `python-gobject`, `smbclient`
 - An unlocked user keyring (`gnome-keyring`)
 
-The plugin never runs `sudo` or `pkexec`. It does not install packages, write
-sudoers rules, or change `/etc/fstab`.
+Mounts stay in the logged-in user session and do not change `/etc/fstab`.
 
 ## Install
 
@@ -75,8 +74,12 @@ Optionally remove saved share names (this does not delete keyring secrets):
 
 ```bash
 rm -r "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-smb-mapper"
-rm -r "$HOME/Shares"
 ```
+
+Shortcuts this plugin created are individual symlinks named after each share
+label, for example `~/Shares/HomeShare`. Remove those links one at a time if
+you no longer want them. Do not recursively delete `~/Shares` if you keep other
+files there.
 
 Forget stored passwords from Seahorse / the Secret Service, or with:
 

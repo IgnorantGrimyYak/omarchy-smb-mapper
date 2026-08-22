@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+- Render server-supplied names and helper errors as plain text.
+- Bound `smbclient` browse calls with a timeout, output cap, and name filter.
+- Replace `~/Shares/<label>` only when it is this plugin's owned shortcut.
+- Stop telling people to recursively delete `~/Shares` on uninstall.
+
 ## 1.0.1
 
 - Detect GVFS mounts when Samba lowercases the share name.

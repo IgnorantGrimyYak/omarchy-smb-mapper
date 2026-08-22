@@ -8,12 +8,45 @@ function parseOutput(text) {
   }
 }
 
+function plainText(value, fallback) {
+  var text = String(value == null ? "" : value)
+  text = text.replace(/[\x00-\x1F\x7F<>`]/g, "")
+  text = text.replace(/\\/g, "")
+  text = text.replace(/\s+/g, " ").trim()
+  if (text.length > 160)
+    text = text.slice(0, 157) + "..."
+  return text || (fallback || "")
+}
+
+function sanitizeShareName(value) {
+  var raw = String(value == null ? "" : value).trim()
+  if (!raw || raw === "." || raw === "..")
+    return ""
+  if (/[\\/:*?"<>|\x00-\x1F]/.test(raw))
+    return ""
+  var text = plainText(raw, "")
+  return text && text.length <= 80 ? text : ""
+}
+
+function sanitizeBrowseList(names) {
+  var out = []
+  var seen = {}
+  var list = names || []
+  for (var i = 0; i < list.length && out.length < 32; i++) {
+    var name = sanitizeShareName(list[i])
+    if (!name || seen[name])
+      continue
+    seen[name] = true
+    out.push(name)
+  }
+  return out
+}
+
 function processError(text, fallback) {
   var parsed = parseOutput(text)
   if (parsed && parsed.error)
-    return parsed.error
-  var raw = String(text || "").trim()
-  return raw || fallback
+    return plainText(parsed.error, fallback)
+  return plainText(String(text || "").trim(), fallback)
 }
 
 function helperPathFromUrl(url) {
@@ -34,7 +67,7 @@ function statusLabel(share, busyId, busyKind, failure) {
   if (!share)
     return ""
   if (failure && failure.id === share.id)
-    return failure.message || "Failed"
+    return plainText(failure.message, "Failed")
   if (busyId === share.id) {
     if (busyKind === "mount")
       return "Connecting…"
@@ -77,7 +110,7 @@ function heroMeta(mounted, total) {
 function shareSubtitle(share) {
   if (!share)
     return ""
-  return "//" + share.host + "/" + share.share
+  return "//" + plainText(share.host, "server") + "/" + plainText(share.share, "share")
 }
 
 function emptyForm() {

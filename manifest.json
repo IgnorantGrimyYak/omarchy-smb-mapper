@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.bmontythe3rd.smb-mapper",
   "name": "SMB Drive Mapper",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Bryan Montgomery",
   "license": "MIT",
   "description": "Map SMB/CIFS network shares from the Omarchy bar with libsecret-backed credentials and one-click mount, unmount, and automount.",

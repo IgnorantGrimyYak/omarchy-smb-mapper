@@ -23,10 +23,10 @@ assert.strictEqual(
   context.statusLabel({ id: "a" }, "a", "mount", { id: "", message: "" }),
   "Connecting…"
 )
-assert.strictEqual(
-  context.processError('{"ok":false,"error":"bad host"}', "fallback"),
-  "bad host"
-)
+assert.strictEqual(context.processError('{"ok":false,"error":"<b>bad host"}', "fallback"), "bbad host")
+assert.strictEqual(context.sanitizeShareName("<img>media"), "")
+assert.strictEqual(context.sanitizeShareName("media"), "media")
+assert.strictEqual(JSON.stringify(context.sanitizeBrowseList(["media", "<b>x", "media", "../etc"])), '["media"]')
 
 const payload = context.requestPayload({
   label: " NAS ",

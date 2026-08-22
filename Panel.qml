@@ -260,7 +260,7 @@ Panel {
       root.browsing = false
       if (exitCode === 0) {
         var parsed = root.parseOutput(browseOutput.text)
-        root.browseResults = parsed && parsed.shares ? parsed.shares : []
+        root.browseResults = Model.sanitizeBrowseList(parsed && parsed.shares ? parsed.shares : [])
         root.statusMessage = root.browseResults.length ? "" : "No folders were advertised on that server"
       } else {
         root.browseResults = []
@@ -379,6 +379,7 @@ Panel {
           width: parent.width
           visible: root.doctorHint !== ""
           text: root.doctorHint
+          textFormat: Text.PlainText
           wrapMode: Text.WordWrap
           color: root.urgent
           font.family: root.fontFamily
@@ -389,6 +390,7 @@ Panel {
           width: parent.width
           visible: root.statusMessage !== "" && root.doctorHint === ""
           text: root.statusMessage
+          textFormat: Text.PlainText
           wrapMode: Text.WordWrap
           color: root.failure.message ? root.urgent : root.dim
           font.family: root.fontFamily
@@ -456,13 +458,15 @@ Panel {
               model: root.browseResults
               delegate: Button {
                 required property string modelData
-                text: modelData
+                text: Model.sanitizeShareName(modelData)
+                tooltipText: Model.sanitizeShareName(modelData)
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 fontSize: Style.font.caption
                 bordered: true
-                selected: root.form.share === modelData
-                onClicked: root.form = Model.setFormField(root.form, "share", modelData)
+                visible: text !== ""
+                selected: root.form.share === text
+                onClicked: if (text) root.form = Model.setFormField(root.form, "share", text)
               }
             }
           }
@@ -693,7 +697,8 @@ Panel {
 
         Text {
           width: parent.width
-          text: row.share ? row.share.label : ""
+          text: row.share ? Model.plainText(row.share.label, "") : ""
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -703,6 +708,7 @@ Panel {
         Text {
           width: parent.width
           text: Model.shareSubtitle(row.share)
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -713,6 +719,7 @@ Panel {
           width: parent.width
           visible: row.statusText !== ""
           text: row.statusText
+          textFormat: Text.PlainText
           color: row.statusColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

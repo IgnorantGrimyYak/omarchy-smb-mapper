@@ -31,6 +31,11 @@ HOST_RE = re.compile(
 SHARE_RE = re.compile(r"^[^\\/:*?\"<>|\x00-\x1f]{1,80}$")
 USER_RE = re.compile(r"^[^\\/:\x00-\x1f]{0,128}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f<>`]")
+SMBCLIENT_TIMEOUT_SEC = 8
+SMBCLIENT_OUTPUT_LIMIT = 65536
+SMBCLIENT_MAX_SHARES = 32
+ERROR_LIMIT = 160
 
 
 class HelperError(Exception):
@@ -39,8 +44,16 @@ class HelperError(Exception):
         self.code = code
 
 
+def public_error(message: str) -> str:
+    text = CONTROL_RE.sub("", str(message or "")).replace("\\", "").strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > ERROR_LIMIT:
+        text = text[: ERROR_LIMIT - 3] + "..."
+    return text or "The SMB helper reported an error"
+
+
 def fail(message: str, code: int = 1) -> None:
-    emit({"ok": False, "error": message}, stream=sys.stderr)
+    emit({"ok": False, "error": public_error(message)}, stream=sys.stderr)
     raise SystemExit(code)
 
 
@@ -462,34 +475,74 @@ def is_mounted(record: dict[str, Any]) -> bool:
     return bool(mounted_path(record))
 
 
+def owned_plugin_symlink(link: Path) -> bool:
+    if not link.is_symlink():
+        return False
+    try:
+        info = link.lstat()
+    except OSError:
+        return False
+    if info.st_uid != os.getuid():
+        return False
+    try:
+        return link.parent.resolve() == shares_dir().resolve()
+    except OSError:
+        return False
+
+
+def allowed_existing_target(link: Path) -> bool:
+    try:
+        resolved = link.resolve()
+    except OSError:
+        return False
+    roots: list[Path] = []
+    try:
+        roots.append(gvfs_root().resolve())
+    except OSError:
+        pass
+    try:
+        roots.append((runtime_dir() / "mnt").resolve())
+    except OSError:
+        pass
+    for root in roots:
+        try:
+            if root.exists() and (resolved == root or root in resolved.parents):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def point_symlink(record: dict[str, Any], target: str) -> None:
     link = share_link(record)
-    parent = shares_dir()
-    if link.exists() and not link.is_symlink():
-        raise HelperError(f"{link} already exists and is not a shortcut created by this plugin")
-    if link.is_symlink() or link.exists():
+    if link.is_symlink():
+        if not owned_plugin_symlink(link) or not allowed_existing_target(link):
+            raise HelperError(f"{link.name} already exists in Shares and is not this plugin's shortcut")
         link.unlink()
+    elif link.exists():
+        raise HelperError(f"{link.name} already exists in Shares and is not a shortcut created by this plugin")
     os.symlink(target, link, target_is_directory=True)
-    if link.resolve().parent == parent and not Path(target).exists():
-        pass
 
 
 def remove_symlink(record: dict[str, Any]) -> None:
     link = share_link(record)
-    if link.is_symlink():
-        link.unlink()
-    elif link.exists():
-        raise HelperError(f"{link} is not a shortcut created by this plugin")
+    if not link.exists() and not link.is_symlink():
+        return
+    if not owned_plugin_symlink(link):
+        if link.exists() and not link.is_symlink():
+            raise HelperError(f"{link.name} is not a shortcut created by this plugin")
+        return
+    link.unlink()
 
 
 def gio_mount(record: dict[str, Any], password: str) -> str:
     if test_mode():
         target = runtime_dir() / "mnt" / record["id"]
         target.mkdir(parents=True, exist_ok=True)
+        point_symlink(record, str(target))
         mounts = current_mounts()
         mounts[smb_uri(record).rstrip("/")] = str(target)
         write_private_json(test_mounts_file(), mounts)
-        point_symlink(record, str(target))
         return str(target)
 
     try:
@@ -543,14 +596,14 @@ def gio_mount(record: dict[str, Any], password: str) -> str:
     folder.mount_enclosing_volume(Gio.MountMountFlags.NONE, operation, None, on_done)
     loop.run()
     if error:
-        raise HelperError(error["message"])
+        raise HelperError("Could not mount that share")
 
     try:
         mount = folder.find_enclosing_mount(None)
         root = mount.get_root() if mount else None
         path = root.get_path() if root else ""
     except GLib.Error as exc:
-        raise HelperError(exc.message or str(exc)) from exc
+        raise HelperError("Could not mount that share") from exc
     if not path:
         raise HelperError("The share mounted but no local path was reported")
     point_symlink(record, path)
@@ -575,14 +628,23 @@ def gio_unmount(record: dict[str, Any]) -> None:
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or "Unmount failed"
         if "not mounted" not in detail.lower() and "can’t unmount" not in detail.lower() and "can't unmount" not in detail.lower():
-            raise HelperError(detail)
+            raise HelperError("Could not disconnect that share")
     remove_symlink(record)
+
+
+def smbclient_bin() -> str:
+    override = os.environ.get("OMARCHY_SMB_SMBCLIENT", "").strip()
+    if override:
+        return override
+    path = shutil.which("smbclient")
+    if not path:
+        raise HelperError("smbclient is not installed")
+    return path
 
 
 def browse_host(host: str, username: str, domain: str, password: str, guest: bool) -> list[str]:
     host = validate_host(host)
-    if shutil.which("smbclient") is None:
-        raise HelperError("smbclient is not installed")
+    client = smbclient_bin()
     fd, cred_name = tempfile.mkstemp(prefix="smb-", dir=str(runtime_dir()), text=True)
     cred = Path(cred_name)
     try:
@@ -592,27 +654,49 @@ def browse_host(host: str, username: str, domain: str, password: str, guest: boo
             handle.write(f"password={password}\n")
             if domain:
                 handle.write(f"domain={domain}\n")
-        command = ["smbclient", "-L", host, "-A", str(cred), "-m", "SMB3"]
+        command = [client, "-L", host, "-A", str(cred), "-m", "SMB3"]
         if guest:
             command.append("-N")
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=SMBCLIENT_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HelperError("Timed out listing shares on that server") from exc
     finally:
         try:
             cred.unlink()
         except OSError:
             pass
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    if len(stdout) > SMBCLIENT_OUTPUT_LIMIT or len(stderr) > SMBCLIENT_OUTPUT_LIMIT:
+        raise HelperError("Share list from the server was too large")
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip() or "Could not list shares"
-        raise HelperError(detail.splitlines()[-1])
+        raise HelperError("Could not list shares on that server")
     names: list[str] = []
-    for line in result.stdout.splitlines():
-        match = re.match(r"\s*([^\s].*?)\s+Disk\s+", line)
+    seen: set[str] = set()
+    for line in stdout.splitlines():
+        match = re.match(r"^\s*(.+?)\s+Disk(?:\s+.*)?$", line)
         if not match:
             continue
         name = match.group(1).strip()
         if name.endswith("$"):
             continue
+        try:
+            name = validate_share(name)
+        except HelperError:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
         names.append(name)
+        if len(names) >= SMBCLIENT_MAX_SHARES:
+            break
     return names
 
 
@@ -703,9 +787,9 @@ def cmd_update(args: list[str]) -> None:
     current.update(record)
     save_store(store)
     if old_label != record["label"]:
-        old_link = shares_dir() / old_label
-        if old_link.is_symlink():
-            old_link.unlink()
+        old_record = dict(record)
+        old_record["label"] = old_label
+        remove_symlink(old_record)
         if is_mounted(record):
             point_symlink(record, mounted_path(record))
     emit({"ok": True, "share": status_payload(record)})

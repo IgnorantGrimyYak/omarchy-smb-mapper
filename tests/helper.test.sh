@@ -50,6 +50,20 @@ share_id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["share"]["
 listed=$(run '' list | json_ok)
 python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["shares"][0]["mounted"] is False' "$listed" || fail "new share should start unmounted"
 
+mkdir -p "$OMARCHY_SMB_SHARES_DIR/NAS"
+if run '' mount "$share_id" >/dev/null 2>"$fixture_dir/dir-collision.err"; then
+  fail "mount replaced a directory in Shares"
+fi
+grep -q 'already exists' "$fixture_dir/dir-collision.err" || fail "directory collision error was unclear"
+rmdir "$OMARCHY_SMB_SHARES_DIR/NAS"
+
+ln -s /tmp "$OMARCHY_SMB_SHARES_DIR/NAS"
+if run '' mount "$share_id" >/dev/null 2>"$fixture_dir/symlink-collision.err"; then
+  fail "mount replaced an unrelated symlink in Shares"
+fi
+grep -q 'already exists' "$fixture_dir/symlink-collision.err" || fail "unrelated symlink error was unclear"
+rm "$OMARCHY_SMB_SHARES_DIR/NAS"
+
 mounted=$(run '' mount "$share_id" | json_ok)
 python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["share"]["mounted"] is True' "$mounted" || fail "mount failed"
 
@@ -92,5 +106,25 @@ python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["ok"] is 
 
 listed=$(run '' list | json_ok)
 python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert len(data["shares"])==1' "$listed" || fail "expected only the guest share to remain"
+
+mkdir -p "$fixture_dir/mock-bin"
+cat >"$fixture_dir/mock-bin/smbclient" <<'SH'
+#!/usr/bin/env bash
+printf '  <img src=x>     Disk\n  media            Disk\n'
+exit 0
+SH
+chmod +x "$fixture_dir/mock-bin/smbclient"
+OMARCHY_SMB_SMBCLIENT=$fixture_dir/mock-bin/smbclient run '{"host":"nas.local","username":"bryan","password":"x"}' browse >"$fixture_dir/browse.json"
+python3 -c 'import json; data=json.load(open("'"$fixture_dir"'/browse.json")); assert data["ok"] is True and data["shares"]==["media"], data' || fail "browse leaked markup share names"
+
+cat >"$fixture_dir/mock-bin/smbclient-hang" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+chmod +x "$fixture_dir/mock-bin/smbclient-hang"
+if OMARCHY_SMB_SMBCLIENT=$fixture_dir/mock-bin/smbclient-hang run '{"host":"nas.local","username":"bryan","password":"x"}' browse >/dev/null 2>"$fixture_dir/browse-timeout.err"; then
+  fail "browse did not time out"
+fi
+grep -q 'Timed out' "$fixture_dir/browse-timeout.err" || fail "browse timeout error was unclear"
 
 echo "helper tests passed"
