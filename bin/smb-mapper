@@ -1,0 +1,801 @@
+#!/usr/bin/env python3
+"""SMB Drive Mapper helper for Omarchy.
+
+Share metadata is stored in a user-owned JSON file. Passwords never go on
+disk, never appear in argv, and are passed only over stdin or libsecret.
+Mounts use GVFS, so no root or polkit privilege is required.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+APP_ID = "omarchy-smb-mapper"
+SCHEMA = "org.omarchy.smb-mapper"
+CONFIG_VERSION = 1
+HOST_RE = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+    r"|\d{1,3}(?:\.\d{1,3}){3}|\[[0-9A-Fa-f:.]+\])$"
+)
+SHARE_RE = re.compile(r"^[^\\/:*?\"<>|\x00-\x1f]{1,80}$")
+USER_RE = re.compile(r"^[^\\/:\x00-\x1f]{0,128}$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+
+
+class HelperError(Exception):
+    def __init__(self, message: str, code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def fail(message: str, code: int = 1) -> None:
+    emit({"ok": False, "error": message}, stream=sys.stderr)
+    raise SystemExit(code)
+
+
+def emit(payload: Any, stream=sys.stdout) -> None:
+    json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
+    stream.write("\n")
+    stream.flush()
+
+
+def env_path(name: str, default: Path) -> Path:
+    value = os.environ.get(name, "").strip()
+    return Path(value).expanduser() if value else default
+
+
+def config_dir() -> Path:
+    base = env_path(
+        "OMARCHY_SMB_CONFIG_DIR",
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_ID,
+    )
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(base, 0o700)
+    return base
+
+
+def shares_dir() -> Path:
+    base = env_path("OMARCHY_SMB_SHARES_DIR", Path.home() / "Shares")
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return base
+
+
+def runtime_dir() -> Path:
+    base = env_path(
+        "OMARCHY_SMB_RUNTIME_DIR",
+        Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / APP_ID,
+    )
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(base, 0o700)
+    return base
+
+
+def test_mode() -> bool:
+    return os.environ.get("OMARCHY_SMB_TEST", "") == "1"
+
+
+def shares_file() -> Path:
+    return config_dir() / "shares.json"
+
+
+def secret_map_file() -> Path:
+    return runtime_dir() / "test-secrets.json"
+
+
+def test_mounts_file() -> Path:
+    return runtime_dir() / "test-mounts.json"
+
+
+def read_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HelperError(f"Could not read {path.name}: {exc}") from exc
+
+
+def write_private_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent), text=True)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def load_store() -> dict[str, Any]:
+    data = read_json_file(shares_file(), {"version": CONFIG_VERSION, "shares": []})
+    if not isinstance(data, dict) or data.get("version") != CONFIG_VERSION:
+        raise HelperError("Share database is missing or uses an unsupported version")
+    shares = data.get("shares")
+    if not isinstance(shares, list):
+        raise HelperError("Share database is invalid")
+    return {"version": CONFIG_VERSION, "shares": shares}
+
+
+def save_store(store: dict[str, Any]) -> None:
+    write_private_json(shares_file(), store)
+
+
+def read_stdin_object() -> dict[str, Any]:
+    if sys.stdin.isatty():
+        return {}
+    raw = sys.stdin.readline()
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HelperError(f"Invalid JSON on stdin: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HelperError("Stdin JSON must be an object")
+    return payload
+
+
+def take_secret(payload: dict[str, Any]) -> str:
+    secret = payload.pop("password", "")
+    if secret is None:
+        return ""
+    if not isinstance(secret, str):
+        raise HelperError("Password must be a string")
+    return secret
+
+
+def validate_host(host: str) -> str:
+    value = host.strip()
+    if not HOST_RE.match(value):
+        raise HelperError("Server must be a hostname or IP address")
+    return value
+
+
+def validate_share(name: str) -> str:
+    value = name.strip().strip("/")
+    if not SHARE_RE.match(value) or value in {".", ".."}:
+        raise HelperError("Share name is invalid")
+    return value
+
+
+def validate_user(value: str) -> str:
+    text = value.strip()
+    if not USER_RE.match(text):
+        raise HelperError("Username contains invalid characters")
+    return text
+
+
+def validate_domain(value: str) -> str:
+    return validate_user(value)
+
+
+def validate_label(value: str, fallback: str) -> str:
+    text = (value or fallback).strip()
+    if not LABEL_RE.match(text):
+        raise HelperError("Label may use letters, numbers, spaces, dots, underscores, and dashes")
+    return text
+
+
+def validate_port(value: Any) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HelperError("Port must be a number") from exc
+    if port < 1 or port > 65535:
+        raise HelperError("Port must be between 1 and 65535")
+    return port
+
+
+def public_share(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record["id"],
+        "label": record["label"],
+        "host": record["host"],
+        "share": record["share"],
+        "username": record.get("username", ""),
+        "domain": record.get("domain", ""),
+        "port": record.get("port", 445),
+        "guest": bool(record.get("guest")),
+        "automount": bool(record.get("automount")),
+        "uri": smb_uri(record),
+        "path": str(share_link(record)),
+        "hasSecret": False if record.get("guest") else secret_exists(record["id"]),
+    }
+
+
+def smb_uri(record: dict[str, Any]) -> str:
+    host = record["host"]
+    port = int(record.get("port") or 445)
+    netloc = host if port == 445 else f"{host}:{port}"
+    share = quote(record["share"], safe="")
+    if record.get("guest"):
+        return f"smb://{netloc}/{share}"
+    user = quote(record.get("username") or "", safe="")
+    domain = quote(record.get("domain") or "", safe="")
+    if domain and user:
+        return f"smb://{domain};{user}@{netloc}/{share}"
+    if user:
+        return f"smb://{user}@{netloc}/{share}"
+    return f"smb://{netloc}/{share}"
+
+
+def share_link(record: dict[str, Any]) -> Path:
+    return shares_dir() / record["label"]
+
+
+def find_share(store: dict[str, Any], share_id: str) -> dict[str, Any]:
+    for item in store["shares"]:
+        if item.get("id") == share_id:
+            return item
+    raise HelperError("Share not found")
+
+
+def parse_share_fields(payload: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = dict(existing or {})
+    host = validate_host(str(payload.get("host", base.get("host", ""))))
+    share = validate_share(str(payload.get("share", base.get("share", ""))))
+    username = validate_user(str(payload.get("username", base.get("username", ""))))
+    domain = validate_domain(str(payload.get("domain", base.get("domain", ""))))
+    guest = bool(payload.get("guest", base.get("guest", False)))
+    if not guest and not username:
+        raise HelperError("Username is required unless this is a guest share")
+    if guest:
+        username = ""
+        domain = ""
+    label = validate_label(str(payload.get("label", base.get("label", ""))), share)
+    port = validate_port(payload.get("port", base.get("port", 445)))
+    automount = bool(payload.get("automount", base.get("automount", False)))
+    record = {
+        "id": base.get("id") or secrets.token_hex(8),
+        "label": label,
+        "host": host,
+        "share": share,
+        "username": username,
+        "domain": domain,
+        "port": port,
+        "guest": guest,
+        "automount": automount,
+    }
+    for other in load_store()["shares"]:
+        if other["id"] == record["id"]:
+            continue
+        if other["label"] == record["label"]:
+            raise HelperError("Another share already uses that label")
+    return record
+
+
+def secret_label(record: dict[str, Any]) -> str:
+    return f"Omarchy SMB {record['label']} (//{record['host']}/{record['share']})"
+
+
+def secret_tool(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.setdefault("LC_ALL", "C")
+    return subprocess.run(
+        ["secret-tool", *args],
+        input=stdin,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+
+
+def secret_exists(share_id: str) -> bool:
+    if test_mode():
+        secrets_map = read_json_file(secret_map_file(), {})
+        return bool(secrets_map.get(share_id))
+    result = secret_tool("lookup", "application", APP_ID, "share-id", share_id)
+    return result.returncode == 0 and bool(result.stdout)
+
+
+def store_secret(record: dict[str, Any], password: str) -> None:
+    if record.get("guest"):
+        return
+    if not password:
+        if secret_exists(record["id"]):
+            return
+        raise HelperError("Password is required for this share")
+    if test_mode():
+        secrets_map = read_json_file(secret_map_file(), {})
+        secrets_map[record["id"]] = password
+        write_private_json(secret_map_file(), secrets_map)
+        return
+    result = secret_tool(
+        "store",
+        "--label",
+        secret_label(record),
+        "application",
+        APP_ID,
+        "xdg:schema",
+        SCHEMA,
+        "protocol",
+        "smb",
+        "share-id",
+        record["id"],
+        "server",
+        record["host"],
+        "share",
+        record["share"],
+        "user",
+        record.get("username") or "guest",
+        stdin=password,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or "libsecret rejected the credential"
+        raise HelperError(f"Could not store password in the system keyring: {detail}")
+
+
+def lookup_secret(share_id: str) -> str:
+    if test_mode():
+        return str(read_json_file(secret_map_file(), {}).get(share_id, ""))
+    result = secret_tool("lookup", "application", APP_ID, "share-id", share_id)
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def clear_secret(share_id: str) -> None:
+    if test_mode():
+        secrets_map = read_json_file(secret_map_file(), {})
+        secrets_map.pop(share_id, None)
+        write_private_json(secret_map_file(), secrets_map)
+        return
+    secret_tool("clear", "application", APP_ID, "share-id", share_id)
+
+
+def gvfs_root() -> Path:
+    return Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "gvfs"
+
+
+def gvfs_path_for(record: dict[str, Any]) -> str:
+    root = gvfs_root()
+    if not root.exists():
+        return ""
+    host = record["host"].lower()
+    share = record["share"].lower()
+    user = (record.get("username") or "").lower()
+    for entry in root.iterdir():
+        name = entry.name.lower()
+        if "smb-share:" not in name:
+            continue
+        if f"server={host}" not in name:
+            continue
+        if f"share={share}" not in name:
+            continue
+        if user and f"user={user}" in name.replace(",", ","):
+            return str(entry)
+        if not user:
+            return str(entry)
+        return str(entry)
+    return ""
+
+
+def current_mounts() -> dict[str, str]:
+    if test_mode():
+        data = read_json_file(test_mounts_file(), {})
+        return {str(k): str(v) for k, v in data.items()}
+    mounts: dict[str, str] = {}
+    listed = subprocess.run(["gio", "mount", "-l"], text=True, capture_output=True, check=False)
+    for line in (listed.stdout or "").splitlines():
+        if "->" not in line or "smb://" not in line:
+            continue
+        uri = line[line.index("smb://") :].strip().rstrip("/")
+        mounts[uri] = ""
+    return mounts
+
+
+def mounted_path(record: dict[str, Any]) -> str:
+    uri = smb_uri(record).rstrip("/")
+    mounts = current_mounts()
+    if test_mode():
+        return mounts.get(uri, "")
+    path = gvfs_path_for(record)
+    if uri in mounts or path:
+        return path or mounts.get(uri, "")
+    link = share_link(record)
+    if link.is_symlink():
+        try:
+            resolved = link.resolve()
+            if resolved.exists():
+                return str(resolved)
+        except OSError:
+            pass
+    return ""
+
+
+def is_mounted(record: dict[str, Any]) -> bool:
+    return bool(mounted_path(record))
+
+
+def point_symlink(record: dict[str, Any], target: str) -> None:
+    link = share_link(record)
+    parent = shares_dir()
+    if link.exists() and not link.is_symlink():
+        raise HelperError(f"{link} already exists and is not a shortcut created by this plugin")
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    os.symlink(target, link, target_is_directory=True)
+    if link.resolve().parent == parent and not Path(target).exists():
+        pass
+
+
+def remove_symlink(record: dict[str, Any]) -> None:
+    link = share_link(record)
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        raise HelperError(f"{link} is not a shortcut created by this plugin")
+
+
+def gio_mount(record: dict[str, Any], password: str) -> str:
+    if test_mode():
+        target = runtime_dir() / "mnt" / record["id"]
+        target.mkdir(parents=True, exist_ok=True)
+        mounts = current_mounts()
+        mounts[smb_uri(record).rstrip("/")] = str(target)
+        write_private_json(test_mounts_file(), mounts)
+        point_symlink(record, str(target))
+        return str(target)
+
+    try:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+    except (ImportError, ValueError) as exc:
+        raise HelperError("python-gobject is required to mount SMB shares") from exc
+
+    uri = smb_uri(record)
+    folder = Gio.File.new_for_uri(uri)
+    operation = Gio.MountOperation()
+    loop = GLib.MainLoop()
+    error: dict[str, str] = {}
+
+    def on_ask_password(_op, _message, _default_user, _default_domain, _flags) -> None:
+        if record.get("guest"):
+            operation.set_anonymous(True)
+        else:
+            if record.get("username"):
+                operation.set_username(record["username"])
+            if record.get("domain"):
+                operation.set_domain(record["domain"])
+            operation.set_password(password)
+        operation.set_password_save(Gio.PasswordSave.NEVER)
+        operation.reply(Gio.MountOperationResult.HANDLED)
+
+    def on_done(source, result) -> None:
+        try:
+            source.mount_enclosing_volume_finish(result)
+        except GLib.Error as exc:
+            message = exc.message or str(exc)
+            if "already mounted" not in message.lower():
+                error["message"] = message
+        loop.quit()
+
+    operation.connect("ask-password", on_ask_password)
+    try:
+        mount = folder.find_enclosing_mount(None)
+        if mount is not None:
+            root = mount.get_root()
+            path = root.get_path() if root else ""
+            if path:
+                point_symlink(record, path)
+                return path
+    except GLib.Error:
+        pass
+
+    folder.mount_enclosing_volume(Gio.MountMountFlags.NONE, operation, None, on_done)
+    loop.run()
+    if error:
+        raise HelperError(error["message"])
+
+    try:
+        mount = folder.find_enclosing_mount(None)
+        root = mount.get_root() if mount else None
+        path = root.get_path() if root else ""
+    except GLib.Error as exc:
+        raise HelperError(exc.message or str(exc)) from exc
+    if not path:
+        raise HelperError("The share mounted but no local path was reported")
+    point_symlink(record, path)
+    return path
+
+
+def gio_unmount(record: dict[str, Any]) -> None:
+    if test_mode():
+        mounts = current_mounts()
+        mounts.pop(smb_uri(record).rstrip("/"), None)
+        write_private_json(test_mounts_file(), mounts)
+        remove_symlink(record)
+        return
+
+    uri = smb_uri(record)
+    result = subprocess.run(
+        ["gio", "mount", "-u", uri],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or "Unmount failed"
+        if "not mounted" not in detail.lower() and "can’t unmount" not in detail.lower() and "can't unmount" not in detail.lower():
+            raise HelperError(detail)
+    remove_symlink(record)
+
+
+def browse_host(host: str, username: str, domain: str, password: str, guest: bool) -> list[str]:
+    host = validate_host(host)
+    if shutil.which("smbclient") is None:
+        raise HelperError("smbclient is not installed")
+    fd, cred_name = tempfile.mkstemp(prefix="smb-", dir=str(runtime_dir()), text=True)
+    cred = Path(cred_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"username={username or 'guest'}\n")
+            handle.write(f"password={password}\n")
+            if domain:
+                handle.write(f"domain={domain}\n")
+        command = ["smbclient", "-L", host, "-A", str(cred), "-m", "SMB3"]
+        if guest:
+            command.append("-N")
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+    finally:
+        try:
+            cred.unlink()
+        except OSError:
+            pass
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or "Could not list shares"
+        raise HelperError(detail.splitlines()[-1])
+    names: list[str] = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*([^\s].*?)\s+Disk\s+", line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if name.endswith("$"):
+            continue
+        names.append(name)
+    return names
+
+
+def command_which(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def gvfs_smb_available() -> bool:
+    candidates = [
+        Path("/usr/lib/gvfs/gvfsd-smb"),
+        Path("/usr/libexec/gvfsd-smb"),
+        Path("/usr/lib/gvfsd-smb"),
+    ]
+    return any(path.exists() for path in candidates)
+
+
+def doctor() -> dict[str, Any]:
+    keyring = False
+    if test_mode():
+        keyring = True
+    elif command_which("secret-tool"):
+        probe = secret_tool("search", "application", APP_ID)
+        keyring = probe.returncode == 0 or "could not connect" not in (probe.stderr or "").lower()
+    return {
+        "ok": command_which("gio") and gvfs_smb_available() and command_which("secret-tool"),
+        "gio": command_which("gio"),
+        "gvfsSmb": gvfs_smb_available(),
+        "secretTool": command_which("secret-tool"),
+        "keyring": keyring,
+        "smbclient": command_which("smbclient"),
+        "pythonGobject": _gobject_available(),
+        "configDir": str(config_dir()),
+        "sharesDir": str(shares_dir()),
+    }
+
+
+def _gobject_available() -> bool:
+    if test_mode():
+        return True
+    try:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio  # noqa: F401
+
+        return True
+    except (ImportError, ValueError):
+        return False
+
+
+def status_payload(record: dict[str, Any]) -> dict[str, Any]:
+    item = public_share(record)
+    path = mounted_path(record)
+    item["mounted"] = bool(path)
+    item["mountPath"] = path
+    return item
+
+
+def cmd_list(_args: list[str]) -> None:
+    store = load_store()
+    emit({"ok": True, "shares": [status_payload(item) for item in store["shares"]], "doctor": doctor()})
+
+
+def cmd_add(_args: list[str]) -> None:
+    payload = read_stdin_object()
+    password = take_secret(payload)
+    record = parse_share_fields(payload)
+    store_secret(record, password)
+    store = load_store()
+    store["shares"].append(record)
+    save_store(store)
+    emit({"ok": True, "share": status_payload(record)})
+
+
+def cmd_update(args: list[str]) -> None:
+    if not args:
+        raise HelperError("Missing share id")
+    payload = read_stdin_object()
+    password = take_secret(payload)
+    store = load_store()
+    current = find_share(store, args[0])
+    old_label = current["label"]
+    record = parse_share_fields(payload, current)
+    if password:
+        store_secret(record, password)
+    elif record.get("guest"):
+        clear_secret(record["id"])
+    current.update(record)
+    save_store(store)
+    if old_label != record["label"]:
+        old_link = shares_dir() / old_label
+        if old_link.is_symlink():
+            old_link.unlink()
+        if is_mounted(record):
+            point_symlink(record, mounted_path(record))
+    emit({"ok": True, "share": status_payload(record)})
+
+
+def cmd_remove(args: list[str]) -> None:
+    if not args:
+        raise HelperError("Missing share id")
+    store = load_store()
+    record = find_share(store, args[0])
+    if is_mounted(record):
+        gio_unmount(record)
+    clear_secret(record["id"])
+    store["shares"] = [item for item in store["shares"] if item["id"] != record["id"]]
+    save_store(store)
+    emit({"ok": True, "id": record["id"]})
+
+
+def cmd_mount(args: list[str]) -> None:
+    if not args:
+        raise HelperError("Missing share id")
+    payload = read_stdin_object()
+    password = take_secret(payload)
+    store = load_store()
+    record = find_share(store, args[0])
+    if is_mounted(record):
+        emit({"ok": True, "share": status_payload(record), "alreadyMounted": True})
+        return
+    if not record.get("guest"):
+        password = password or lookup_secret(record["id"])
+        if not password:
+            raise HelperError("No password is saved for this share")
+        if payload.get("savePassword"):
+            store_secret(record, password)
+    path = gio_mount(record, password)
+    emit({"ok": True, "share": status_payload(record), "mountPath": path})
+
+
+def cmd_unmount(args: list[str]) -> None:
+    if not args:
+        raise HelperError("Missing share id")
+    store = load_store()
+    record = find_share(store, args[0])
+    gio_unmount(record)
+    emit({"ok": True, "share": status_payload(record)})
+
+
+def cmd_automount(_args: list[str]) -> None:
+    store = load_store()
+    mounted = []
+    skipped = []
+    errors = []
+    for record in store["shares"]:
+        if not record.get("automount"):
+            continue
+        if is_mounted(record):
+            skipped.append(status_payload(record))
+            continue
+        try:
+            password = "" if record.get("guest") else lookup_secret(record["id"])
+            if not record.get("guest") and not password:
+                raise HelperError("No saved password")
+            gio_mount(record, password)
+            mounted.append(status_payload(record))
+        except HelperError as exc:
+            errors.append({"id": record["id"], "label": record["label"], "error": str(exc)})
+    emit({"ok": True, "mounted": mounted, "skipped": skipped, "errors": errors})
+
+
+def cmd_browse(_args: list[str]) -> None:
+    payload = read_stdin_object()
+    password = take_secret(payload)
+    names = browse_host(
+        str(payload.get("host", "")),
+        str(payload.get("username", "")),
+        str(payload.get("domain", "")),
+        password,
+        bool(payload.get("guest")),
+    )
+    emit({"ok": True, "shares": names})
+
+
+def cmd_open(args: list[str]) -> None:
+    if not args:
+        raise HelperError("Missing share id")
+    store = load_store()
+    record = find_share(store, args[0])
+    path = mounted_path(record) or str(share_link(record))
+    if not Path(path).exists():
+        raise HelperError("Share is not mounted")
+    subprocess.run(["xdg-open", path], check=False)
+    emit({"ok": True, "path": path})
+
+
+def cmd_doctor(_args: list[str]) -> None:
+    emit({"ok": True, **doctor()})
+
+
+COMMANDS = {
+    "list": cmd_list,
+    "add": cmd_add,
+    "update": cmd_update,
+    "remove": cmd_remove,
+    "mount": cmd_mount,
+    "unmount": cmd_unmount,
+    "automount": cmd_automount,
+    "browse": cmd_browse,
+    "open": cmd_open,
+    "doctor": cmd_doctor,
+}
+
+
+def main(argv: list[str]) -> int:
+    os.umask(0o077)
+    if len(argv) < 2 or argv[1] in {"-h", "--help", "help"}:
+        emit({"ok": True, "commands": sorted(COMMANDS)})
+        return 0
+    command = argv[1]
+    handler = COMMANDS.get(command)
+    if handler is None:
+        fail(f"Unknown command: {command}")
+    try:
+        handler(argv[2:])
+    except HelperError as exc:
+        fail(str(exc), exc.code)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

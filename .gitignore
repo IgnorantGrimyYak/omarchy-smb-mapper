@@ -1,0 +1,6 @@
+*.log
+.qmllint.ini.user
+test-results/
+__pycache__/
+*.pyc
+.venv/
