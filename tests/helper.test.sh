@@ -53,6 +53,18 @@ python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["shares"]
 mounted=$(run '' mount "$share_id" | json_ok)
 python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["share"]["mounted"] is True' "$mounted" || fail "mount failed"
 
+python3 - <<'PY' || fail "mount status should ignore SMB share-name case"
+import json, os, pathlib
+path = pathlib.Path(os.environ["OMARCHY_SMB_RUNTIME_DIR"]) / "test-mounts.json"
+data = json.loads(path.read_text())
+path.write_text(json.dumps({key.lower(): value for key, value in data.items()}))
+PY
+cased=$(run '' list | json_ok)
+python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["shares"][0]["mounted"] is True' "$cased" || fail "mount status missed a case-folded GVFS URI"
+
+opened=$(run '' open "$share_id" | json_ok)
+python3 -c 'import json,sys; data=json.loads(sys.argv[1]); assert data["ok"] is True and data["path"]' "$opened" || fail "open should succeed without probing GVFS fuse existence"
+
 link=$OMARCHY_SMB_SHARES_DIR/NAS
 [[ -L $link ]] || fail "expected convenience symlink in Shares"
 

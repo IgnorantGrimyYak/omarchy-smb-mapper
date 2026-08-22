@@ -111,10 +111,16 @@ Panel {
   }
 
   function openShare(share) {
-    if (!share || !share.mounted || openProc.running)
+    if (!share)
       return
-    openProc.command = [helperPath, "open", share.id]
-    openProc.running = true
+    var target = share.uri || share.mountPath || share.path
+    if (!target)
+      return
+    if (!share.mounted && !share.mountPath)
+      return
+    // Detach through uwsm so Files outlives the panel process, and prefer the
+    // smb:// URI because GVFS fuse paths often fail Path.exists() / xdg-open.
+    Quickshell.execDetached(["uwsm-app", "--", "nautilus", "--new-window", target])
   }
 
   function browseShares() {
@@ -260,15 +266,6 @@ Panel {
         root.browseResults = []
         root.statusMessage = root.processError(browseError.text, "Could not browse that server")
       }
-    }
-  }
-
-  Process {
-    id: openProc
-    stderr: StdioCollector { id: openError; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (exitCode !== 0)
-        root.statusMessage = root.processError(openError.text, "Could not open the mounted folder")
     }
   }
 
@@ -623,6 +620,7 @@ Panel {
 
     MouseArea {
       anchors.fill: parent
+      z: -1
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onContainsMouseChanged: if (containsMouse) {
@@ -662,7 +660,7 @@ Panel {
           tooltipText: "Open folder"
           foreground: root.foreground
           fontFamily: root.fontFamily
-          enabled: !!(row.share && row.share.mounted)
+          enabled: !!(row.share && (row.share.mounted || row.share.mountPath))
           onClicked: root.openShare(row.share)
         }
 

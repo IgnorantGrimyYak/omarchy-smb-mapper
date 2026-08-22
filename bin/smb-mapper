@@ -388,6 +388,20 @@ def gvfs_path_for(record: dict[str, Any]) -> str:
     return ""
 
 
+def uris_match(left: str, right: str) -> bool:
+    return left.rstrip("/").lower() == right.rstrip("/").lower()
+
+
+def lookup_mount_path(uri: str, mounts: dict[str, str]) -> str:
+    for known, path in mounts.items():
+        if uris_match(known, uri) and path:
+            return path
+    for known in mounts:
+        if uris_match(known, uri):
+            return mounts[known]
+    return ""
+
+
 def current_mounts() -> dict[str, str]:
     if test_mode():
         data = read_json_file(test_mounts_file(), {})
@@ -402,14 +416,37 @@ def current_mounts() -> dict[str, str]:
     return mounts
 
 
+def gio_mount_path(uri: str) -> str:
+    try:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+    except (ImportError, ValueError):
+        return ""
+    folder = Gio.File.new_for_uri(uri)
+    try:
+        mount = folder.find_enclosing_mount(None)
+    except GLib.Error:
+        return ""
+    if mount is None:
+        return ""
+    root = mount.get_root()
+    return (root.get_path() if root else "") or ""
+
+
 def mounted_path(record: dict[str, Any]) -> str:
     uri = smb_uri(record).rstrip("/")
     mounts = current_mounts()
     if test_mode():
-        return mounts.get(uri, "")
-    path = gvfs_path_for(record)
-    if uri in mounts or path:
-        return path or mounts.get(uri, "")
+        return lookup_mount_path(uri, mounts)
+    path = gio_mount_path(uri) or gvfs_path_for(record) or lookup_mount_path(uri, mounts)
+    if path:
+        try:
+            point_symlink(record, path)
+        except HelperError:
+            pass
+        return path
     link = share_link(record)
     if link.is_symlink():
         try:
@@ -756,11 +793,21 @@ def cmd_open(args: list[str]) -> None:
         raise HelperError("Missing share id")
     store = load_store()
     record = find_share(store, args[0])
-    path = mounted_path(record) or str(share_link(record))
-    if not Path(path).exists():
+    path = mounted_path(record)
+    uri = smb_uri(record)
+    if not path:
         raise HelperError("Share is not mounted")
-    subprocess.run(["xdg-open", path], check=False)
-    emit({"ok": True, "path": path})
+    if test_mode():
+        emit({"ok": True, "path": path, "uri": uri})
+        return
+    target = uri or path
+    subprocess.Popen(
+        ["uwsm-app", "--", "nautilus", "--new-window", target],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    emit({"ok": True, "path": path, "uri": uri})
 
 
 def cmd_doctor(_args: list[str]) -> None:

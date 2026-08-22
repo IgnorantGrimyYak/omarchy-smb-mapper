@@ -3,10 +3,22 @@
 Map SMB/CIFS network shares from the Omarchy bar without putting passwords in
 config files or on the command line.
 
+<p align="center">
+  <img src="docs/screenshots/screenshot-2026-08-21_20-00-58.png" alt="SMB Drives panel on the Omarchy bar with no saved shares yet" width="100%">
+</p>
+
 The plugin saves share metadata locally, stores credentials in the system
 keyring through `secret-tool` / libsecret, and mounts with GVFS (`gio`) so
 **no root or polkit prompt is required**. Connected shares also appear as
 shortcuts under `~/Shares`.
+
+**This plugin does not write `/etc/fstab`.** Connect automatically remounts the
+share in your user session when Omarchy starts. It never adds a kernel CIFS
+entry, never stores a credentials file for fstab, and never asks for sudo.
+
+<p align="center">
+  <img src="docs/screenshots/screenshot-2026-08-21_20-01-21.png" alt="Add share form with server, share name, username, password, guest access, and connect automatically" width="100%">
+</p>
 
 ## Requirements
 
@@ -43,9 +55,9 @@ omarchy restart shell
 5. Click a saved share to connect or disconnect it.
 6. Enable **Connect automatically** if it should mount after login.
 
-Mounted folders open with the default file manager and are also linked from
-`~/Shares/<label>`. Press `n` to add a share, `o` to open the selected folder,
-`r` to refresh, and Escape to close the panel.
+The open-folder action launches Files (Nautilus) on the `smb://` URI. Mounted
+shares are also linked from `~/Shares/<label>`. Press `n` to add a share, `o`
+to open the selected folder, `r` to refresh, and Escape to close the panel.
 
 ## Update
 
@@ -93,7 +105,6 @@ plugins run as the current user and are not sandboxed.
 
 ```bash
 tests/run.sh
-qmllint -I /usr/share/omarchy/shell Panel.qml Service.qml
 ```
 
 The helper tests use a fake mount backend (`OMARCHY_SMB_TEST=1`) and never
