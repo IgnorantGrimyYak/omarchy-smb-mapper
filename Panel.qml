@@ -27,6 +27,8 @@ Panel {
   property bool editing: false
   property bool browsing: false
   property bool cursorActive: false
+  property bool mountPolling: false
+  property string pollingId: ""
 
   readonly property int mountedCount: Model.mountedCount(shares)
   readonly property string doctorHint: Model.doctorHint(doctor)
@@ -48,8 +50,9 @@ Panel {
   }
 
   function runHelper(kind, args, payload, shareId) {
-    if (actionProc.running)
+    if (actionProc.running) {
       return
+    }
     busyKind = kind
     busyId = shareId || ""
     failure = { id: "", message: "" }
@@ -57,6 +60,7 @@ Panel {
     var command = [helperPath, kind]
     for (var i = 0; i < (args || []).length; i++)
       command.push(args[i])
+    statusMessage = "Running: " + command.join(" ")
     actionProc.command = command
     actionProc.stdinEnabled = pendingPayload !== ""
     actionProc.running = true
@@ -87,6 +91,9 @@ Panel {
     if (form.id === share.id && form.password)
       payload.password = form.password
     runHelper("mount", [share.id], Object.keys(payload).length ? payload : null, share.id)
+    // Start polling for mount completion since process may not exit
+    mountPolling = true
+    pollingId = share.id
   }
 
   function unmountShare(share) {
@@ -191,10 +198,22 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        root.statusMessage = "Loaded shares"
         var parsed = root.parseOutput(text)
         if (parsed && parsed.ok) {
           listProc.outputValid = true
           root.shares = parsed.shares || []
+          for (var j = 0; j < root.shares.length; j++) {
+            var s = root.shares[j]
+            if (s.mounted && root.busyId === s.id) {
+              root.busyId = ""
+              root.busyKind = ""
+            }
+            if (s.mounted && root.mountPolling && root.pollingId === s.id) {
+              root.mountPolling = false
+              root.pollingId = ""
+            }
+          }
           root.doctor = parsed.doctor || {}
           if (root.selectedIndex >= root.shares.length)
             root.selectedIndex = Math.max(0, root.shares.length - 1)
@@ -215,10 +234,18 @@ Panel {
     stdout: StdioCollector { id: actionOutput; waitForEnd: true }
     stderr: StdioCollector { id: actionError; waitForEnd: true }
     onStarted: {
+      root.statusMessage = "Process started"
       if (root.pendingPayload !== "") {
         write(root.pendingPayload + "\n")
+        root.statusMessage = "Sent payload"
         root.pendingPayload = ""
-        stdinEnabled = false
+      }
+      stdinEnabled = false
+      root.statusMessage = "Waiting for process to finish"
+    }
+    onRunningChanged: {
+      if (!running) {
+        root.statusMessage = "Process finished"
       }
     }
     onExited: function(exitCode) {
@@ -226,13 +253,14 @@ Panel {
       var shareId = root.busyId
       root.busyKind = ""
       root.busyId = ""
+      root.mountPolling = false
+      root.pollingId = ""
+      root.statusMessage = "Action completed, refreshing"
       if (exitCode === 0) {
         root.form = Model.setFormField(root.form, "password", "")
         if (kind === "add" || kind === "update") {
           root.editing = false
-          root.statusMessage = kind === "add" ? "Share saved" : "Share updated"
         } else if (kind === "remove") {
-          root.statusMessage = "Share removed"
         }
         root.refresh()
       } else {
@@ -240,7 +268,6 @@ Panel {
           id: shareId,
           message: root.processError(actionError.text, "Could not complete that action")
         }
-        root.statusMessage = root.failure.message
       }
     }
   }
@@ -266,6 +293,16 @@ Panel {
         root.browseResults = []
         root.statusMessage = root.processError(browseError.text, "Could not browse that server")
       }
+    }
+  }
+
+  Timer {
+    id: mountPollTimer
+    interval: 2000
+    repeat: true
+    running: root.mountPolling
+    onTriggered: {
+      root.refresh()
     }
   }
 

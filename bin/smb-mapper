@@ -36,6 +36,7 @@ SMBCLIENT_TIMEOUT_SEC = 8
 SMBCLIENT_OUTPUT_LIMIT = 65536
 SMBCLIENT_MAX_SHARES = 32
 ERROR_LIMIT = 160
+GIO_MOUNT_TIMEOUT = 30
 
 
 class HelperError(Exception):
@@ -536,6 +537,7 @@ def remove_symlink(record: dict[str, Any]) -> None:
 
 
 def gio_mount(record: dict[str, Any], password: str) -> str:
+    """Mount SMB share using Gio API with main loop and timeout."""
     if test_mode():
         target = runtime_dir() / "mnt" / record["id"]
         target.mkdir(parents=True, exist_ok=True)
@@ -547,41 +549,43 @@ def gio_mount(record: dict[str, Any], password: str) -> str:
 
     try:
         import gi
-
         gi.require_version("Gio", "2.0")
         gi.require_version("GLib", "2.0")
         from gi.repository import Gio, GLib
     except (ImportError, ValueError) as exc:
         raise HelperError("python-gobject is required to mount SMB shares") from exc
 
+    import time
+
     uri = smb_uri(record)
     folder = Gio.File.new_for_uri(uri)
     operation = Gio.MountOperation()
     loop = GLib.MainLoop()
-    error: dict[str, str] = {}
+    result: dict[str, Any] = {"path": None, "error": None}
 
-    def on_ask_password(_op, _message, _default_user, _default_domain, _flags) -> None:
-        if record.get("guest"):
-            operation.set_anonymous(True)
-        else:
-            if record.get("username"):
-                operation.set_username(record["username"])
-            if record.get("domain"):
-                operation.set_domain(record["domain"])
-            operation.set_password(password)
+    def on_ask_password(_op, _message, _default_user, _default_domain, _flags):
+        operation.set_username(record.get("username", ""))
+        operation.set_domain(record.get("domain", ""))
+        operation.set_password(password)
         operation.set_password_save(Gio.PasswordSave.NEVER)
         operation.reply(Gio.MountOperationResult.HANDLED)
 
-    def on_done(source, result) -> None:
+    def on_done(source, res):
         try:
-            source.mount_enclosing_volume_finish(result)
+            source.mount_enclosing_volume_finish(res)
         except GLib.Error as exc:
-            message = exc.message or str(exc)
-            if "already mounted" not in message.lower():
-                error["message"] = message
+            msg = exc.message or str(exc)
+            if "already mounted" not in msg.lower():
+                result["error"] = msg
         loop.quit()
 
+    def timeout_cb():
+        loop.quit()
+        return False
+
     operation.connect("ask-password", on_ask_password)
+
+    # Check if already mounted
     try:
         mount = folder.find_enclosing_mount(None)
         if mount is not None:
@@ -593,21 +597,37 @@ def gio_mount(record: dict[str, Any], password: str) -> str:
     except GLib.Error:
         pass
 
+    # Set timeout to ensure loop exits
+    timeout_id = GLib.timeout_add_seconds(GIO_MOUNT_TIMEOUT, timeout_cb)
+
     folder.mount_enclosing_volume(Gio.MountMountFlags.NONE, operation, None, on_done)
     loop.run()
-    if error:
-        raise HelperError("Could not mount that share")
 
+    GLib.source_remove(timeout_id)
+
+    if result["error"]:
+        raise HelperError("Could not mount that share: " + result["error"])
+
+    # Try to get mount path
     try:
         mount = folder.find_enclosing_mount(None)
-        root = mount.get_root() if mount else None
-        path = root.get_path() if root else ""
-    except GLib.Error as exc:
-        raise HelperError("Could not mount that share") from exc
-    if not path:
-        raise HelperError("The share mounted but no local path was reported")
-    point_symlink(record, path)
-    return path
+        if mount:
+            root = mount.get_root()
+            path = root.get_path() if root else ""
+            if path:
+                point_symlink(record, path)
+                return path
+    except GLib.Error:
+        pass
+
+    # Fallback: use mounted_path() to detect
+    for attempt in range(5):
+        path = mounted_path(record)
+        if path:
+            return path
+        time.sleep(0.5)
+
+    raise HelperError("Could not mount that share")
 
 
 def gio_unmount(record: dict[str, Any]) -> None:
