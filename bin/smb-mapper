@@ -111,9 +111,15 @@ def test_mounts_file() -> Path:
     return runtime_dir() / "test-mounts.json"
 
 
+MAX_FILE_SIZE = 1048576  # 1 MB
+
 def read_json_file(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
+    if not path.is_file():
+        return default
+    if path.stat().st_size > MAX_FILE_SIZE:
+        raise HelperError(f"{path.name} is too large")
     try:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
@@ -151,12 +157,16 @@ def save_store(store: dict[str, Any]) -> None:
     write_private_json(shares_file(), store)
 
 
+MAX_STDIN_LINE = 65536  # 64 KB
+
 def read_stdin_object() -> dict[str, Any]:
     if sys.stdin.isatty():
         return {}
-    raw = sys.stdin.readline()
+    raw = sys.stdin.readline(MAX_STDIN_LINE)
     if not raw.strip():
         return {}
+    if len(raw) == MAX_STDIN_LINE:
+        raise HelperError("Stdin line too long")
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -309,6 +319,7 @@ def secret_tool(*args: str, stdin: str | None = None) -> subprocess.CompletedPro
         capture_output=True,
         check=False,
         env=env,
+        timeout=10,
     )
 
 
@@ -421,7 +432,7 @@ def current_mounts() -> dict[str, str]:
         data = read_json_file(test_mounts_file(), {})
         return {str(k): str(v) for k, v in data.items()}
     mounts: dict[str, str] = {}
-    listed = subprocess.run(["gio", "mount", "-l"], text=True, capture_output=True, check=False)
+    listed = subprocess.run(["gio", "mount", "-l"], text=True, capture_output=True, check=False, timeout=10)
     for line in (listed.stdout or "").splitlines():
         if "->" not in line or "smb://" not in line:
             continue
@@ -644,6 +655,7 @@ def gio_unmount(record: dict[str, Any]) -> None:
         text=True,
         capture_output=True,
         check=False,
+        timeout=15,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip() or "Unmount failed"
